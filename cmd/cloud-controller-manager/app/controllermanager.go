@@ -31,12 +31,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/server/healthz"
-	"k8s.io/apiserver/pkg/util/term"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	cloudprovider "k8s.io/cloud-provider"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/cli/globalflag"
+	"k8s.io/component-base/term"
 	"k8s.io/component-base/version"
 	"k8s.io/component-base/version/verflag"
 	"k8s.io/klog"
@@ -92,6 +92,9 @@ the cloud specific control loops shipped with Kubernetes.`,
 		// hoist this flag from the global flagset to preserve the commandline until
 		// the gce cloudprovider is removed.
 		globalflag.Register(namedFlagSets.FlagSet("generic"), "cloud-provider-gce-lb-src-cidrs")
+	}
+	if flag.CommandLine.Lookup("cloud-provider-gce-l7lb-src-cidrs") != nil {
+		globalflag.Register(namedFlagSets.FlagSet("generic"), "cloud-provider-gce-l7lb-src-cidrs")
 	}
 	for _, f := range namedFlagSets.FlagSets {
 		fs.AddFlagSet(f)

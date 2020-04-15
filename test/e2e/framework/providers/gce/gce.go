@@ -17,6 +17,7 @@ limitations under the License.
 package gce
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os/exec"
@@ -187,7 +188,7 @@ func (p *Provider) EnsureLoadBalancerResourcesDeleted(ip, portRange string) erro
 
 func getGCEZoneForGroup(group string) (string, error) {
 	output, err := exec.Command("gcloud", "compute", "instance-groups", "managed", "list",
-		"--project="+framework.TestContext.CloudConfig.ProjectID, "--format=value(zone)", "--filter=name="+group).CombinedOutput()
+		"--project="+framework.TestContext.CloudConfig.ProjectID, "--format=value(zone)", "--filter=name="+group).Output()
 	if err != nil {
 		return "", fmt.Errorf("Failed to get zone for node group %s: %s", group, output)
 	}
@@ -215,7 +216,7 @@ func (p *Provider) CreatePD(zone string) (string, error) {
 	}
 
 	tags := map[string]string{}
-	if err := p.gceCloud.CreateDisk(pdName, gcecloud.DiskTypeStandard, zone, 2 /* sizeGb */, tags); err != nil {
+	if _, err := p.gceCloud.CreateDisk(pdName, gcecloud.DiskTypeStandard, zone, 2 /* sizeGb */, tags); err != nil {
 		return "", err
 	}
 	return pdName, nil
@@ -310,10 +311,10 @@ func (p *Provider) cleanupGCEResources(c clientset.Interface, loadBalancerName, 
 	return
 }
 
-// LoadBalancerSrcRanges contains the ranges of ips used by the GCE load balancers (l4 & L7)
-// for proxying client requests and performing health checks.
-func (p *Provider) LoadBalancerSrcRanges() []string {
-	return gcecloud.LoadBalancerSrcRanges()
+// L4LoadBalancerSrcRanges contains the ranges of ips used by the GCE L4 load
+// balancers for proxying client requests and performing health checks.
+func (p *Provider) L4LoadBalancerSrcRanges() []string {
+	return gcecloud.L4LoadBalancerSrcRanges()
 }
 
 // EnableAndDisableInternalLB returns functions for both enabling and disabling internal Load Balancer
@@ -353,16 +354,6 @@ func SetInstanceTags(cloudConfig framework.CloudConfig, instanceName, zone strin
 	return resTags.Items
 }
 
-// GetNodeTags gets k8s node tag from one of the nodes
-func GetNodeTags(c clientset.Interface, cloudConfig framework.CloudConfig) []string {
-	nodes := framework.GetReadySchedulableNodesOrDie(c)
-	if len(nodes.Items) == 0 {
-		framework.Logf("GetNodeTags: Found 0 node.")
-		return []string{}
-	}
-	return GetInstanceTags(cloudConfig, nodes.Items[0].Name).Items
-}
-
 // IsGoogleAPIHTTPErrorCode returns true if the error is a google api
 // error matching the corresponding HTTP error code.
 func IsGoogleAPIHTTPErrorCode(err error, code int) bool {
@@ -381,7 +372,7 @@ func GetGCECloud() (*gcecloud.Cloud, error) {
 
 // GetClusterID returns cluster ID
 func GetClusterID(c clientset.Interface) (string, error) {
-	cm, err := c.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(gcecloud.UIDConfigMapName, metav1.GetOptions{})
+	cm, err := c.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(context.TODO(), gcecloud.UIDConfigMapName, metav1.GetOptions{})
 	if err != nil || cm == nil {
 		return "", fmt.Errorf("error getting cluster ID: %v", err)
 	}

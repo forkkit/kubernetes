@@ -17,6 +17,7 @@ limitations under the License.
 package apiserver
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -27,12 +28,15 @@ import (
 	"testing"
 	"time"
 
+	"sigs.k8s.io/yaml"
+
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	genericfeatures "k8s.io/apiserver/pkg/features"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes"
@@ -41,7 +45,6 @@ import (
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/master"
 	"k8s.io/kubernetes/test/integration/framework"
-	"sigs.k8s.io/yaml"
 )
 
 func setup(t testing.TB, groupVersions ...schema.GroupVersion) (*httptest.Server, clientset.Interface, framework.CloseFunc) {
@@ -119,13 +122,13 @@ func TestApplyAlsoCreates(t *testing.T) {
 			Name(tc.name).
 			Param("fieldManager", "apply_test").
 			Body([]byte(tc.body)).
-			Do().
+			Do(context.TODO()).
 			Get()
 		if err != nil {
 			t.Fatalf("Failed to create object using Apply patch: %v", err)
 		}
 
-		_, err = client.CoreV1().RESTClient().Get().Namespace("default").Resource(tc.resource).Name(tc.name).Do().Get()
+		_, err = client.CoreV1().RESTClient().Get().Namespace("default").Resource(tc.resource).Name(tc.name).Do(context.TODO()).Get()
 		if err != nil {
 			t.Fatalf("Failed to retrieve object: %v", err)
 		}
@@ -137,7 +140,7 @@ func TestApplyAlsoCreates(t *testing.T) {
 			Name(tc.name).
 			Param("fieldManager", "apply_test_2").
 			Body([]byte(tc.body)).
-			Do().
+			Do(context.TODO()).
 			Get()
 		if err != nil {
 			t.Fatalf("Failed to re-apply object using Apply patch: %v", err)
@@ -180,39 +183,22 @@ func TestNoOpUpdateSameResourceVersion(t *testing.T) {
 		}
 	}`)
 
-	o, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
+	_, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
 		Namespace("default").
 		Param("fieldManager", "apply_test").
 		Resource(podResource).
 		Name(podName).
 		Body(podBytes).
-		Do().
+		Do(context.TODO()).
 		Get()
 	if err != nil {
 		t.Fatalf("Failed to create object: %v", err)
 	}
 
-	// Need to update once for some reason
-	// TODO (#82042): Remove this update once possible
-	b, err := json.MarshalIndent(o, "\t", "\t")
-	if err != nil {
-		t.Fatalf("Failed to marshal created object: %v", err)
-	}
-	_, err = client.CoreV1().RESTClient().Put().
-		Namespace("default").
-		Resource(podResource).
-		Name(podName).
-		Body(b).
-		Do().
-		Get()
-	if err != nil {
-		t.Fatalf("Failed to apply first no-op update: %v", err)
-	}
-
 	// Sleep for one second to make sure that the times of each update operation is different.
 	time.Sleep(1 * time.Second)
 
-	createdObject, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource(podResource).Name(podName).Do().Get()
+	createdObject, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource(podResource).Name(podName).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to retrieve created object: %v", err)
 	}
@@ -233,13 +219,13 @@ func TestNoOpUpdateSameResourceVersion(t *testing.T) {
 		Resource(podResource).
 		Name(podName).
 		Body(createdBytes).
-		Do().
+		Do(context.TODO()).
 		Get()
 	if err != nil {
 		t.Fatalf("Failed to apply no-op update: %v", err)
 	}
 
-	updatedObject, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource(podResource).Name(podName).Do().Get()
+	updatedObject, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource(podResource).Name(podName).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to retrieve updated object: %v", err)
 	}
@@ -291,9 +277,9 @@ func TestCreateOnApplyFailsWithUID(t *testing.T) {
 				}]
 			}
 		}`)).
-		Do().
+		Do(context.TODO()).
 		Get()
-	if !errors.IsConflict(err) {
+	if !apierrors.IsConflict(err) {
 		t.Fatalf("Expected conflict error but got: %v", err)
 	}
 }
@@ -340,7 +326,7 @@ func TestApplyUpdateApplyConflictForced(t *testing.T) {
 		Resource("deployments").
 		Name("deployment").
 		Param("fieldManager", "apply_test").
-		Body(obj).Do().Get()
+		Body(obj).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to create object using Apply patch: %v", err)
 	}
@@ -350,7 +336,7 @@ func TestApplyUpdateApplyConflictForced(t *testing.T) {
 		Namespace("default").
 		Resource("deployments").
 		Name("deployment").
-		Body([]byte(`{"spec":{"replicas": 5}}`)).Do().Get()
+		Body([]byte(`{"spec":{"replicas": 5}}`)).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to patch object: %v", err)
 	}
@@ -361,11 +347,11 @@ func TestApplyUpdateApplyConflictForced(t *testing.T) {
 		Resource("deployments").
 		Name("deployment").
 		Param("fieldManager", "apply_test").
-		Body([]byte(obj)).Do().Get()
+		Body([]byte(obj)).Do(context.TODO()).Get()
 	if err == nil {
 		t.Fatalf("Expecting to get conflicts when applying object")
 	}
-	status, ok := err.(*errors.StatusError)
+	status, ok := err.(*apierrors.StatusError)
 	if !ok {
 		t.Fatalf("Expecting to get conflicts as API error")
 	}
@@ -380,9 +366,249 @@ func TestApplyUpdateApplyConflictForced(t *testing.T) {
 		Name("deployment").
 		Param("force", "true").
 		Param("fieldManager", "apply_test").
-		Body([]byte(obj)).Do().Get()
+		Body([]byte(obj)).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to apply object with force: %v", err)
+	}
+}
+
+// TestApplyGroupsManySeparateUpdates tests that when many different managers update the same object,
+// the number of managedFields entries will only grow to a certain size.
+func TestApplyGroupsManySeparateUpdates(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	_, client, closeFn := setup(t)
+	defer closeFn()
+
+	obj := []byte(`{
+		"apiVersion": "admissionregistration.k8s.io/v1",
+		"kind": "ValidatingWebhookConfiguration",
+		"metadata": {
+			"name": "webhook",
+			"labels": {"applier":"true"},
+		},
+	}`)
+
+	object, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
+		AbsPath("/apis/admissionregistration.k8s.io/v1").
+		Resource("validatingwebhookconfigurations").
+		Name("webhook").
+		Param("fieldManager", "apply_test").
+		Body(obj).Do(context.TODO()).Get()
+	if err != nil {
+		t.Fatalf("Failed to create object using Apply patch: %v", err)
+	}
+
+	for i := 0; i < 20; i++ {
+		unique := fmt.Sprintf("updater%v", i)
+		version := "v1"
+		if i%2 == 0 {
+			version = "v1beta1"
+		}
+		object, err = client.CoreV1().RESTClient().Patch(types.MergePatchType).
+			AbsPath("/apis/admissionregistration.k8s.io/"+version).
+			Resource("validatingwebhookconfigurations").
+			Name("webhook").
+			Param("fieldManager", unique).
+			Body([]byte(`{"metadata":{"labels":{"` + unique + `":"new"}}}`)).Do(context.TODO()).Get()
+		if err != nil {
+			t.Fatalf("Failed to patch object: %v", err)
+		}
+	}
+
+	accessor, err := meta.Accessor(object)
+	if err != nil {
+		t.Fatalf("Failed to get meta accessor: %v", err)
+	}
+
+	// Expect 11 entries, because the cap for update entries is 10, and 1 apply entry
+	if actual, expected := len(accessor.GetManagedFields()), 11; actual != expected {
+		if b, err := json.MarshalIndent(object, "\t", "\t"); err == nil {
+			t.Fatalf("Object expected to contain %v entries in managedFields, but got %v:\n%v", expected, actual, string(b))
+		} else {
+			t.Fatalf("Object expected to contain %v entries in managedFields, but got %v: error marshalling object: %v", expected, actual, err)
+		}
+	}
+
+	// Expect the first entry to have the manager name "apply_test"
+	if actual, expected := accessor.GetManagedFields()[0].Manager, "apply_test"; actual != expected {
+		t.Fatalf("Expected first manager to be named %v but got %v", expected, actual)
+	}
+
+	// Expect the second entry to have the manager name "ancient-changes"
+	if actual, expected := accessor.GetManagedFields()[1].Manager, "ancient-changes"; actual != expected {
+		t.Fatalf("Expected first manager to be named %v but got %v", expected, actual)
+	}
+}
+
+// TestCreateVeryLargeObject tests that a very large object can be created without exceeding the size limit due to managedFields
+func TestCreateVeryLargeObject(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	_, client, closeFn := setup(t)
+	defer closeFn()
+
+	cfg := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "large-create-test-cm",
+			Namespace: "default",
+		},
+		Data: map[string]string{},
+	}
+
+	for i := 0; i < 9999; i++ {
+		unique := fmt.Sprintf("this-key-is-very-long-so-as-to-create-a-very-large-serialized-fieldset-%v", i)
+		cfg.Data[unique] = "A"
+	}
+
+	// Should be able to create an object near the object size limit.
+	if _, err := client.CoreV1().ConfigMaps(cfg.Namespace).Create(context.TODO(), cfg, metav1.CreateOptions{}); err != nil {
+		t.Errorf("unable to create large test configMap: %v", err)
+	}
+
+	// Applying to the same object should cause managedFields to go over the object size limit, and fail.
+	_, err := client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
+		Namespace(cfg.Namespace).
+		Resource("configmaps").
+		Name(cfg.Name).
+		Param("fieldManager", "apply_test").
+		Body([]byte(`{
+			"apiVersion": "v1",
+			"kind": "ConfigMap",
+			"metadata": {
+				"name": "large-create-test-cm",
+				"namespace": "default",
+			}
+		}`)).
+		Do(context.TODO()).
+		Get()
+	if err == nil {
+		t.Fatalf("expected to fail to update object using Apply patch, but succeeded")
+	}
+}
+
+// TestUpdateVeryLargeObject tests that a small object can be updated to be very large without exceeding the size limit due to managedFields
+func TestUpdateVeryLargeObject(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	_, client, closeFn := setup(t)
+	defer closeFn()
+
+	cfg := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "large-update-test-cm",
+			Namespace: "default",
+		},
+		Data: map[string]string{"k": "v"},
+	}
+
+	// Create a small config map.
+	cfg, err := client.CoreV1().ConfigMaps(cfg.Namespace).Create(context.TODO(), cfg, metav1.CreateOptions{})
+	if err != nil {
+		t.Errorf("unable to create configMap: %v", err)
+	}
+
+	// Should be able to update a small object to be near the object size limit.
+	var updateErr error
+	pollErr := wait.PollImmediate(100*time.Millisecond, 30*time.Second, func() (bool, error) {
+		updateCfg, err := client.CoreV1().ConfigMaps(cfg.Namespace).Get(context.TODO(), cfg.Name, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+
+		// Apply the large update, then attempt to push it to the apiserver.
+		for i := 0; i < 9999; i++ {
+			unique := fmt.Sprintf("this-key-is-very-long-so-as-to-create-a-very-large-serialized-fieldset-%v", i)
+			updateCfg.Data[unique] = "A"
+		}
+
+		if _, err = client.CoreV1().ConfigMaps(cfg.Namespace).Update(context.TODO(), updateCfg, metav1.UpdateOptions{}); err == nil {
+			return true, nil
+		}
+		updateErr = err
+		return false, nil
+	})
+	if pollErr == wait.ErrWaitTimeout {
+		t.Errorf("unable to update configMap: %v", updateErr)
+	}
+
+	// Applying to the same object should cause managedFields to go over the object size limit, and fail.
+	_, err = client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
+		Namespace(cfg.Namespace).
+		Resource("configmaps").
+		Name(cfg.Name).
+		Param("fieldManager", "apply_test").
+		Body([]byte(`{
+			"apiVersion": "v1",
+			"kind": "ConfigMap",
+			"metadata": {
+				"name": "large-update-test-cm",
+				"namespace": "default",
+			}
+		}`)).
+		Do(context.TODO()).
+		Get()
+	if err == nil {
+		t.Fatalf("expected to fail to update object using Apply patch, but succeeded")
+	}
+}
+
+// TestPatchVeryLargeObject tests that a small object can be patched to be very large without exceeding the size limit due to managedFields
+func TestPatchVeryLargeObject(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ServerSideApply, true)()
+
+	_, client, closeFn := setup(t)
+	defer closeFn()
+
+	cfg := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "large-patch-test-cm",
+			Namespace: "default",
+		},
+		Data: map[string]string{"k": "v"},
+	}
+
+	// Create a small config map.
+	if _, err := client.CoreV1().ConfigMaps(cfg.Namespace).Create(context.TODO(), cfg, metav1.CreateOptions{}); err != nil {
+		t.Errorf("unable to create configMap: %v", err)
+	}
+
+	patchString := `{"data":{"k":"v"`
+	for i := 0; i < 9999; i++ {
+		unique := fmt.Sprintf("this-key-is-very-long-so-as-to-create-a-very-large-serialized-fieldset-%v", i)
+		patchString = fmt.Sprintf("%s,%q:%q", patchString, unique, "A")
+	}
+	patchString = fmt.Sprintf("%s}}", patchString)
+
+	// Should be able to update a small object to be near the object size limit.
+	_, err := client.CoreV1().RESTClient().Patch(types.MergePatchType).
+		AbsPath("/api/v1").
+		Namespace(cfg.Namespace).
+		Resource("configmaps").
+		Name(cfg.Name).
+		Body([]byte(patchString)).Do(context.TODO()).Get()
+	if err != nil {
+		t.Errorf("unable to patch configMap: %v", err)
+	}
+
+	// Applying to the same object should cause managedFields to go over the object size limit, and fail.
+	_, err = client.CoreV1().RESTClient().Patch(types.ApplyPatchType).
+		Namespace("default").
+		Resource("configmaps").
+		Name("large-patch-test-cm").
+		Param("fieldManager", "apply_test").
+		Body([]byte(`{
+			"apiVersion": "v1",
+			"kind": "ConfigMap",
+			"metadata": {
+				"name": "large-patch-test-cm",
+				"namespace": "default",
+			}
+		}`)).
+		Do(context.TODO()).
+		Get()
+	if err == nil {
+		t.Fatalf("expected to fail to update object using Apply patch, but succeeded")
 	}
 }
 
@@ -412,7 +638,7 @@ func TestApplyManagedFields(t *testing.T) {
 				"key": "value"
 			}
 		}`)).
-		Do().
+		Do(context.TODO()).
 		Get()
 	if err != nil {
 		t.Fatalf("Failed to create object using Apply patch: %v", err)
@@ -423,7 +649,7 @@ func TestApplyManagedFields(t *testing.T) {
 		Resource("configmaps").
 		Name("test-cm").
 		Param("fieldManager", "updater").
-		Body([]byte(`{"data":{"new-key": "value"}}`)).Do().Get()
+		Body([]byte(`{"data":{"new-key": "value"}}`)).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to patch object: %v", err)
 	}
@@ -438,12 +664,12 @@ func TestApplyManagedFields(t *testing.T) {
 		Resource("configmaps").
 		Name("test-cm").
 		Param("fieldManager", "updater").
-		Body([]byte(`{"data":{"key": "new value"}}`)).Do().Get()
+		Body([]byte(`{"data":{"key": "new value"}}`)).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to patch object: %v", err)
 	}
 
-	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do().Get()
+	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to retrieve object: %v", err)
 	}
@@ -536,7 +762,7 @@ func TestApplyRemovesEmptyManagedFields(t *testing.T) {
 		Name("test-cm").
 		Param("fieldManager", "apply_test").
 		Body(obj).
-		Do().
+		Do(context.TODO()).
 		Get()
 	if err != nil {
 		t.Fatalf("Failed to create object using Apply patch: %v", err)
@@ -547,12 +773,12 @@ func TestApplyRemovesEmptyManagedFields(t *testing.T) {
 		Resource("configmaps").
 		Name("test-cm").
 		Param("fieldManager", "apply_test").
-		Body(obj).Do().Get()
+		Body(obj).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to patch object: %v", err)
 	}
 
-	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do().Get()
+	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to retrieve object: %v", err)
 	}
@@ -587,7 +813,7 @@ func TestApplyRequiresFieldManager(t *testing.T) {
 		Resource("configmaps").
 		Name("test-cm").
 		Body(obj).
-		Do().
+		Do(context.TODO()).
 		Get()
 	if err == nil {
 		t.Fatalf("Apply should fail to create without fieldManager")
@@ -599,7 +825,7 @@ func TestApplyRequiresFieldManager(t *testing.T) {
 		Name("test-cm").
 		Param("fieldManager", "apply_test").
 		Body(obj).
-		Do().
+		Do(context.TODO()).
 		Get()
 	if err != nil {
 		t.Fatalf("Apply failed to create with fieldManager: %v", err)
@@ -653,7 +879,7 @@ func TestApplyRemoveContainerPort(t *testing.T) {
 		Resource("deployments").
 		Name("deployment").
 		Param("fieldManager", "apply_test").
-		Body(obj).Do().Get()
+		Body(obj).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to create object using Apply patch: %v", err)
 	}
@@ -694,12 +920,12 @@ func TestApplyRemoveContainerPort(t *testing.T) {
 		Resource("deployments").
 		Name("deployment").
 		Param("fieldManager", "apply_test").
-		Body(obj).Do().Get()
+		Body(obj).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to remove container port using Apply patch: %v", err)
 	}
 
-	deployment, err := client.AppsV1().Deployments("default").Get("deployment", metav1.GetOptions{})
+	deployment, err := client.AppsV1().Deployments("default").Get(context.TODO(), "deployment", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Failed to retrieve object: %v", err)
 	}
@@ -753,7 +979,7 @@ func TestApplyFailsWithVersionMismatch(t *testing.T) {
 		Resource("deployments").
 		Name("deployment").
 		Param("fieldManager", "apply_test").
-		Body(obj).Do().Get()
+		Body(obj).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to create object using Apply patch: %v", err)
 	}
@@ -793,11 +1019,11 @@ func TestApplyFailsWithVersionMismatch(t *testing.T) {
 		Resource("deployments").
 		Name("deployment").
 		Param("fieldManager", "apply_test").
-		Body([]byte(obj)).Do().Get()
+		Body([]byte(obj)).Do(context.TODO()).Get()
 	if err == nil {
 		t.Fatalf("Expecting to get version mismatch when applying object")
 	}
-	status, ok := err.(*errors.StatusError)
+	status, ok := err.(*apierrors.StatusError)
 	if !ok {
 		t.Fatalf("Expecting to get version mismatch as API error")
 	}
@@ -873,7 +1099,7 @@ func TestApplyConvertsManagedFieldsVersion(t *testing.T) {
 		AbsPath("/apis/apps/v1").
 		Namespace("default").
 		Resource("deployments").
-		Body(obj).Do().Get()
+		Body(obj).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to create object: %v", err)
 	}
@@ -902,12 +1128,12 @@ func TestApplyConvertsManagedFieldsVersion(t *testing.T) {
 		Resource("deployments").
 		Name("deployment").
 		Param("fieldManager", "sidecar_controller").
-		Body([]byte(obj)).Do().Get()
+		Body([]byte(obj)).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to apply object: %v", err)
 	}
 
-	object, err := client.AppsV1().Deployments("default").Get("deployment", metav1.GetOptions{})
+	object, err := client.AppsV1().Deployments("default").Get(context.TODO(), "deployment", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Failed to retrieve object: %v", err)
 	}
@@ -976,7 +1202,7 @@ func TestClearManagedFieldsWithMergePatch(t *testing.T) {
 				"key": "value"
 			}
 		}`)).
-		Do().
+		Do(context.TODO()).
 		Get()
 	if err != nil {
 		t.Fatalf("Failed to create object using Apply patch: %v", err)
@@ -986,12 +1212,12 @@ func TestClearManagedFieldsWithMergePatch(t *testing.T) {
 		Namespace("default").
 		Resource("configmaps").
 		Name("test-cm").
-		Body([]byte(`{"metadata":{"managedFields": [{}]}}`)).Do().Get()
+		Body([]byte(`{"metadata":{"managedFields": [{}]}}`)).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to patch object: %v", err)
 	}
 
-	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do().Get()
+	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to retrieve object: %v", err)
 	}
@@ -1032,7 +1258,7 @@ func TestClearManagedFieldsWithStrategicMergePatch(t *testing.T) {
 				"key": "value"
 			}
 		}`)).
-		Do().
+		Do(context.TODO()).
 		Get()
 	if err != nil {
 		t.Fatalf("Failed to create object using Apply patch: %v", err)
@@ -1042,12 +1268,12 @@ func TestClearManagedFieldsWithStrategicMergePatch(t *testing.T) {
 		Namespace("default").
 		Resource("configmaps").
 		Name("test-cm").
-		Body([]byte(`{"metadata":{"managedFields": [{}]}}`)).Do().Get()
+		Body([]byte(`{"metadata":{"managedFields": [{}]}}`)).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to patch object: %v", err)
 	}
 
-	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do().Get()
+	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to retrieve object: %v", err)
 	}
@@ -1092,7 +1318,7 @@ func TestClearManagedFieldsWithJSONPatch(t *testing.T) {
 				"key": "value"
 			}
 		}`)).
-		Do().
+		Do(context.TODO()).
 		Get()
 	if err != nil {
 		t.Fatalf("Failed to create object using Apply patch: %v", err)
@@ -1102,12 +1328,12 @@ func TestClearManagedFieldsWithJSONPatch(t *testing.T) {
 		Namespace("default").
 		Resource("configmaps").
 		Name("test-cm").
-		Body([]byte(`[{"op": "replace", "path": "/metadata/managedFields", "value": [{}]}]`)).Do().Get()
+		Body([]byte(`[{"op": "replace", "path": "/metadata/managedFields", "value": [{}]}]`)).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to patch object: %v", err)
 	}
 
-	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do().Get()
+	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to retrieve object: %v", err)
 	}
@@ -1148,7 +1374,7 @@ func TestClearManagedFieldsWithUpdate(t *testing.T) {
 				"key": "value"
 			}
 		}`)).
-		Do().
+		Do(context.TODO()).
 		Get()
 	if err != nil {
 		t.Fatalf("Failed to create object using Apply patch: %v", err)
@@ -1172,12 +1398,12 @@ func TestClearManagedFieldsWithUpdate(t *testing.T) {
 			"data": {
 				"key": "value"
 			}
-		}`)).Do().Get()
+		}`)).Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to patch object: %v", err)
 	}
 
-	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do().Get()
+	object, err := client.CoreV1().RESTClient().Get().Namespace("default").Resource("configmaps").Name("test-cm").Do(context.TODO()).Get()
 	if err != nil {
 		t.Fatalf("Failed to retrieve object: %v", err)
 	}
@@ -1364,7 +1590,7 @@ func getPodBytesWhenEnabled(b *testing.B, pod v1.Pod, format string) []byte {
 		Param("fieldManager", "apply_test").
 		Resource("pods").
 		SetHeader("Accept", format).
-		Body(encodePod(pod)).DoRaw()
+		Body(encodePod(pod)).DoRaw(context.TODO())
 	if err != nil {
 		b.Fatalf("Failed to create object: %#v", err)
 	}
@@ -1387,7 +1613,7 @@ func BenchmarkNoServerSideApplyButSameSize(b *testing.B) {
 		Resource("pods").
 		SetHeader("Content-Type", "application/yaml").
 		SetHeader("Accept", "application/vnd.kubernetes.protobuf").
-		Body(encodePod(pod)).DoRaw()
+		Body(encodePod(pod)).DoRaw(context.TODO())
 	if err != nil {
 		b.Fatalf("Failed to create object: %v", err)
 	}
@@ -1433,7 +1659,7 @@ func benchAll(b *testing.B, client kubernetes.Interface, pod v1.Pod) {
 		Namespace("default").
 		Resource("pods").
 		SetHeader("Content-Type", "application/yaml").
-		Body(encodePod(pod)).Do().Get()
+		Body(encodePod(pod)).Do(context.TODO()).Get()
 	if err != nil {
 		b.Fatalf("Failed to create object: %v", err)
 	}
@@ -1464,7 +1690,7 @@ func benchPostPod(client kubernetes.Interface, pod v1.Pod, parallel int) func(*t
 						Namespace("default").
 						Resource("pods").
 						SetHeader("Content-Type", "application/yaml").
-						Body(encodePod(pod)).Do().Get()
+						Body(encodePod(pod)).Do(context.TODO()).Get()
 					c <- err
 				}(pod)
 			}
@@ -1488,7 +1714,7 @@ func createNamespace(client kubernetes.Interface, name string) error {
 	_, err = client.CoreV1().RESTClient().Get().
 		Resource("namespaces").
 		SetHeader("Content-Type", "application/yaml").
-		Body(namespaceBytes).Do().Get()
+		Body(namespaceBytes).Do(context.TODO()).Get()
 	if err != nil {
 		return fmt.Errorf("Failed to create namespace: %v", err)
 	}
@@ -1509,7 +1735,7 @@ func benchListPod(client kubernetes.Interface, pod v1.Pod, num int) func(*testin
 				Namespace(namespace).
 				Resource("pods").
 				SetHeader("Content-Type", "application/yaml").
-				Body(encodePod(pod)).Do().Get()
+				Body(encodePod(pod)).Do(context.TODO()).Get()
 			if err != nil {
 				b.Fatalf("Failed to create object: %v", err)
 			}
@@ -1522,7 +1748,7 @@ func benchListPod(client kubernetes.Interface, pod v1.Pod, num int) func(*testin
 				Namespace(namespace).
 				Resource("pods").
 				SetHeader("Accept", "application/vnd.kubernetes.protobuf").
-				Do().Get()
+				Do(context.TODO()).Get()
 			if err != nil {
 				b.Fatalf("Failed to patch object: %v", err)
 			}
@@ -1539,7 +1765,7 @@ func benchRepeatedUpdate(client kubernetes.Interface, podName string) func(*test
 				Namespace("default").
 				Resource("pods").
 				Name(podName).
-				Body([]byte(fmt.Sprintf(`[{"op": "replace", "path": "/spec/containers/0/image", "value": "image%d"}]`, i))).Do().Get()
+				Body([]byte(fmt.Sprintf(`[{"op": "replace", "path": "/spec/containers/0/image", "value": "image%d"}]`, i))).Do(context.TODO()).Get()
 			if err != nil {
 				b.Fatalf("Failed to patch object: %v", err)
 			}

@@ -19,23 +19,50 @@ package fieldmanager_test
 import (
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apiserver/pkg/endpoints/handlers/fieldmanager"
+	"k8s.io/apiserver/pkg/endpoints/handlers/fieldmanager/internal"
+
+	"k8s.io/kube-openapi/pkg/util/proto"
+	prototesting "k8s.io/kube-openapi/pkg/util/proto/testing"
+	"sigs.k8s.io/structured-merge-diff/v3/fieldpath"
+	"sigs.k8s.io/structured-merge-diff/v3/merge"
+	"sigs.k8s.io/structured-merge-diff/v3/typed"
 	"sigs.k8s.io/yaml"
 )
 
-type fakeObjectConvertor struct{}
+var fakeSchema = prototesting.Fake{
+	Path: filepath.Join(
+		strings.Repeat(".."+string(filepath.Separator), 8),
+		"api", "openapi-spec", "swagger.json"),
+}
+
+type fakeObjectConvertor struct {
+	converter  merge.Converter
+	apiVersion fieldpath.APIVersion
+}
 
 func (c *fakeObjectConvertor) Convert(in, out, context interface{}) error {
+	if typedValue, ok := in.(*typed.TypedValue); ok {
+		var err error
+		out, err = c.converter.Convert(typedValue, c.apiVersion)
+		return err
+	}
 	out = in
 	return nil
 }
@@ -53,39 +80,66 @@ type fakeObjectDefaulter struct{}
 func (d *fakeObjectDefaulter) Default(in runtime.Object) {}
 
 type TestFieldManager struct {
-	fieldManager fieldmanager.FieldManager
+	fieldManager fieldmanager.Manager
+	emptyObj     runtime.Object
 	liveObj      runtime.Object
 }
 
-func NewTestFieldManager() TestFieldManager {
-	gv := schema.GroupVersion{
-		Group:   "apps",
-		Version: "v1",
-	}
+func NewTestFieldManager(gvk schema.GroupVersionKind) TestFieldManager {
+	m := NewFakeOpenAPIModels()
+	tc := NewFakeTypeConverter(m)
 
-	f, err := fieldmanager.NewCRDFieldManager(
-		nil,
-		&fakeObjectConvertor{},
+	converter := internal.NewVersionConverter(tc, &fakeObjectConvertor{}, gvk.GroupVersion())
+	apiVersion := fieldpath.APIVersion(gvk.GroupVersion().String())
+	f, err := fieldmanager.NewStructuredMergeManager(
+		m,
+		&fakeObjectConvertor{converter, apiVersion},
 		&fakeObjectDefaulter{},
-		gv,
-		gv,
-		true,
+		gvk.GroupVersion(),
+		gvk.GroupVersion(),
 	)
 	if err != nil {
 		panic(err)
 	}
+	live := &unstructured.Unstructured{}
+	live.SetKind(gvk.Kind)
+	live.SetAPIVersion(gvk.GroupVersion().String())
+	f = fieldmanager.NewStripMetaManager(f)
+	f = fieldmanager.NewManagedFieldsUpdater(f)
+	f = fieldmanager.NewBuildManagerInfoManager(f, gvk.GroupVersion())
 	return TestFieldManager{
 		fieldManager: f,
-		liveObj:      &unstructured.Unstructured{},
+		emptyObj:     live,
+		liveObj:      live.DeepCopyObject(),
 	}
 }
 
-func (f *TestFieldManager) Reset() {
-	f.liveObj = &unstructured.Unstructured{}
+func NewFakeTypeConverter(m proto.Models) internal.TypeConverter {
+	tc, err := internal.NewTypeConverter(m, false)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to build TypeConverter: %v", err))
+	}
+	return tc
 }
 
-func (f *TestFieldManager) Apply(obj []byte, manager string, force bool) error {
-	out, err := f.fieldManager.Apply(f.liveObj, obj, manager, force)
+func NewFakeOpenAPIModels() proto.Models {
+	d, err := fakeSchema.OpenAPISchema()
+	if err != nil {
+		panic(err)
+	}
+	m, err := proto.NewOpenAPIData(d)
+	if err != nil {
+		panic(err)
+	}
+	return m
+}
+
+func (f *TestFieldManager) Reset() {
+	f.liveObj = f.emptyObj.DeepCopyObject()
+}
+
+func (f *TestFieldManager) Apply(obj runtime.Object, manager string, force bool) error {
+	out, err := fieldmanager.NewFieldManager(f.fieldManager).Apply(f.liveObj, obj, manager, force)
 	if err == nil {
 		f.liveObj = out
 	}
@@ -93,7 +147,7 @@ func (f *TestFieldManager) Apply(obj []byte, manager string, force bool) error {
 }
 
 func (f *TestFieldManager) Update(obj runtime.Object, manager string) error {
-	out, err := f.fieldManager.Update(f.liveObj, obj, manager)
+	out, err := fieldmanager.NewFieldManager(f.fieldManager).Update(f.liveObj, obj, manager)
 	if err == nil {
 		f.liveObj = out
 	}
@@ -109,9 +163,10 @@ func (f *TestFieldManager) ManagedFields() []metav1.ManagedFieldsEntry {
 	return accessor.GetManagedFields()
 }
 
-// TestUpdateApplyConflict tests that applying to an object, which wasn't created by apply, will give conflicts
+// TestUpdateApplyConflict tests that applying to an object, which
+// wasn't created by apply, will give conflicts
 func TestUpdateApplyConflict(t *testing.T) {
-	f := NewTestFieldManager()
+	f := NewTestFieldManager(schema.FromAPIVersionAndKind("apps/v1", "Deployment"))
 
 	patch := []byte(`{
 		"apiVersion": "apps/v1",
@@ -151,7 +206,8 @@ func TestUpdateApplyConflict(t *testing.T) {
 		t.Fatalf("failed to apply object: %v", err)
 	}
 
-	err := f.Apply([]byte(`{
+	appliedObj := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	if err := yaml.Unmarshal([]byte(`{
 		"apiVersion": "apps/v1",
 		"kind": "Deployment",
 		"metadata": {
@@ -160,14 +216,18 @@ func TestUpdateApplyConflict(t *testing.T) {
 		"spec": {
 			"replicas": 101,
 		}
-	}`), "fieldmanager_conflict", false)
+	}`), &appliedObj.Object); err != nil {
+		t.Fatalf("error decoding YAML: %v", err)
+	}
+
+	err := f.Apply(appliedObj, "fieldmanager_conflict", false)
 	if err == nil || !apierrors.IsConflict(err) {
 		t.Fatalf("Expecting to get conflicts but got %v", err)
 	}
 }
 
 func TestApplyStripsFields(t *testing.T) {
-	f := NewTestFieldManager()
+	f := NewTestFieldManager(schema.FromAPIVersionAndKind("apps/v1", "Deployment"))
 
 	newObj := &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -200,22 +260,70 @@ func TestApplyStripsFields(t *testing.T) {
 }
 
 func TestVersionCheck(t *testing.T) {
-	f := NewTestFieldManager()
+	f := NewTestFieldManager(schema.FromAPIVersionAndKind("apps/v1", "Deployment"))
 
-	// patch has 'apiVersion: apps/v1' and live version is apps/v1 -> no errors
-	err := f.Apply([]byte(`{
+	appliedObj := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	if err := yaml.Unmarshal([]byte(`{
 		"apiVersion": "apps/v1",
 		"kind": "Deployment",
-	}`), "fieldmanager_test", false)
+	}`), &appliedObj.Object); err != nil {
+		t.Fatalf("error decoding YAML: %v", err)
+	}
+
+	// patch has 'apiVersion: apps/v1' and live version is apps/v1 -> no errors
+	err := f.Apply(appliedObj, "fieldmanager_test", false)
 	if err != nil {
 		t.Fatalf("failed to apply object: %v", err)
 	}
 
-	// patch has 'apiVersion: apps/v2' but live version is apps/v1 -> error
-	err = f.Apply([]byte(`{
-		"apiVersion": "apps/v2",
+	appliedObj = &unstructured.Unstructured{Object: map[string]interface{}{}}
+	if err := yaml.Unmarshal([]byte(`{
+		"apiVersion": "apps/v1beta1",
 		"kind": "Deployment",
-	}`), "fieldmanager_test", false)
+	}`), &appliedObj.Object); err != nil {
+		t.Fatalf("error decoding YAML: %v", err)
+	}
+
+	// patch has 'apiVersion: apps/v2' but live version is apps/v1 -> error
+	err = f.Apply(appliedObj, "fieldmanager_test", false)
+	if err == nil {
+		t.Fatalf("expected an error from mismatched patch and live versions")
+	}
+	switch typ := err.(type) {
+	default:
+		t.Fatalf("expected error to be of type %T was %T", apierrors.StatusError{}, typ)
+	case apierrors.APIStatus:
+		if typ.Status().Code != http.StatusBadRequest {
+			t.Fatalf("expected status code to be %d but was %d",
+				http.StatusBadRequest, typ.Status().Code)
+		}
+	}
+}
+func TestVersionCheckDoesNotPanic(t *testing.T) {
+	f := NewTestFieldManager(schema.FromAPIVersionAndKind("apps/v1", "Deployment"))
+
+	appliedObj := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	if err := yaml.Unmarshal([]byte(`{
+		"apiVersion": "apps/v1",
+		"kind": "Deployment",
+	}`), &appliedObj.Object); err != nil {
+		t.Fatalf("error decoding YAML: %v", err)
+	}
+
+	// patch has 'apiVersion: apps/v1' and live version is apps/v1 -> no errors
+	err := f.Apply(appliedObj, "fieldmanager_test", false)
+	if err != nil {
+		t.Fatalf("failed to apply object: %v", err)
+	}
+
+	appliedObj = &unstructured.Unstructured{Object: map[string]interface{}{}}
+	if err := yaml.Unmarshal([]byte(`{
+		}`), &appliedObj.Object); err != nil {
+		t.Fatalf("error decoding YAML: %v", err)
+	}
+
+	// patch has 'apiVersion: apps/v2' but live version is apps/v1 -> error
+	err = f.Apply(appliedObj, "fieldmanager_test", false)
 	if err == nil {
 		t.Fatalf("expected an error from mismatched patch and live versions")
 	}
@@ -231,17 +339,22 @@ func TestVersionCheck(t *testing.T) {
 }
 
 func TestApplyDoesNotStripLabels(t *testing.T) {
-	f := NewTestFieldManager()
+	f := NewTestFieldManager(schema.FromAPIVersionAndKind("v1", "Pod"))
 
-	err := f.Apply([]byte(`{
-		"apiVersion": "apps/v1",
+	appliedObj := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	if err := yaml.Unmarshal([]byte(`{
+		"apiVersion": "v1",
 		"kind": "Pod",
 		"metadata": {
 			"labels": {
 				"a": "b"
 			},
 		}
-	}`), "fieldmanager_test", false)
+	}`), &appliedObj.Object); err != nil {
+		t.Fatalf("error decoding YAML: %v", err)
+	}
+
+	err := f.Apply(appliedObj, "fieldmanager_test", false)
 	if err != nil {
 		t.Fatalf("failed to apply object: %v", err)
 	}
@@ -251,241 +364,312 @@ func TestApplyDoesNotStripLabels(t *testing.T) {
 	}
 }
 
-func BenchmarkApplyNewObject(b *testing.B) {
-	f := NewTestFieldManager()
+func getObjectBytes(file string) []byte {
+	s, err := ioutil.ReadFile(file)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
 
-	b.ReportAllocs()
-	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
-		err := f.Apply([]byte(`{
-		"apiVersion": "apps/v1",
-		"kind": "Pod",
-		"metadata": {
-			"name": "b",
-			"namespace": "b",
-			"creationTimestamp": "2016-05-19T09:59:00Z",
+func TestApplyNewObject(t *testing.T) {
+	tests := []struct {
+		gvk schema.GroupVersionKind
+		obj []byte
+	}{
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Pod"),
+			obj: getObjectBytes("pod.yaml"),
 		},
-                "map": {
-                        "fieldA": 1,
-                        "fieldB": 1,
-                        "fieldC": 1,
-                        "fieldD": 1,
-                        "fieldE": 1,
-                        "fieldF": 1,
-                        "fieldG": 1,
-                        "fieldH": 1,
-                        "fieldI": 1,
-                        "fieldJ": 1,
-                        "fieldK": 1,
-                        "fieldL": 1,
-                        "fieldM": 1,
-                        "fieldN": {
-	                        "fieldN": {
-					"fieldN": {
-						"fieldN": {
-				                        "fieldN": {
-								"value": true
-							},
-						},
-					},
-				},
-			},
-                }
-	}`), "fieldmanager_test", false)
-		if err != nil {
-			b.Fatal(err)
-		}
-		f.Reset()
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Node"),
+			obj: getObjectBytes("node.yaml"),
+		},
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Endpoints"),
+			obj: getObjectBytes("endpoints.yaml"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.gvk.String(), func(t *testing.T) {
+			f := NewTestFieldManager(test.gvk)
+
+			appliedObj := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			if err := yaml.Unmarshal(test.obj, &appliedObj.Object); err != nil {
+				t.Fatalf("error decoding YAML: %v", err)
+			}
+
+			if err := f.Apply(appliedObj, "fieldmanager_test", false); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
-func BenchmarkUpdateNewObject(b *testing.B) {
-	f := NewTestFieldManager()
-
-	y := `{
-		"apiVersion": "apps/v1",
-		"kind": "Deployment",
-		"metadata": {
-			"name": "b",
-			"namespace": "b",
-			"creationTimestamp": "2016-05-19T09:59:00Z",
+func BenchmarkNewObject(b *testing.B) {
+	tests := []struct {
+		gvk schema.GroupVersionKind
+		obj []byte
+	}{
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Pod"),
+			obj: getObjectBytes("pod.yaml"),
 		},
-                "map": {
-                        "fieldA": 1,
-                        "fieldB": 1,
-                        "fieldC": 1,
-                        "fieldD": 1,
-                        "fieldE": 1,
-                        "fieldF": 1,
-                        "fieldG": 1,
-                        "fieldH": 1,
-                        "fieldI": 1,
-                        "fieldJ": 1,
-                        "fieldK": 1,
-                        "fieldL": 1,
-                        "fieldM": 1,
-                        "fieldN": {
-	                        "fieldN": {
-					"fieldN": {
-						"fieldN": {
-				                        "fieldN": {
-								"value": true
-							},
-						},
-					},
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Node"),
+			obj: getObjectBytes("node.yaml"),
+		},
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Endpoints"),
+			obj: getObjectBytes("endpoints.yaml"),
+		},
+	}
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		b.Fatalf("Failed to add to scheme: %v", err)
+	}
+	for _, test := range tests {
+		b.Run(test.gvk.Kind, func(b *testing.B) {
+			f := NewTestFieldManager(test.gvk)
+
+			decoder := serializer.NewCodecFactory(scheme).UniversalDecoder(test.gvk.GroupVersion())
+			newObj, err := runtime.Decode(decoder, test.obj)
+			if err != nil {
+				b.Fatalf("Failed to parse yaml object: %v", err)
+			}
+			objMeta, err := meta.Accessor(newObj)
+			if err != nil {
+				b.Fatalf("Failed to get object meta: %v", err)
+			}
+			objMeta.SetManagedFields([]metav1.ManagedFieldsEntry{
+				{
+					Manager:    "default",
+					Operation:  "Update",
+					APIVersion: "v1",
 				},
-			},
-		},
+			})
+			appliedObj := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			if err := yaml.Unmarshal(test.obj, &appliedObj.Object); err != nil {
+				b.Fatalf("Failed to parse yaml object: %v", err)
+			}
+			b.Run("Update", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for n := 0; n < b.N; n++ {
+					if err := f.Update(newObj, "fieldmanager_test"); err != nil {
+						b.Fatal(err)
+					}
+					f.Reset()
+				}
+			})
+			b.Run("UpdateTwice", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for n := 0; n < b.N; n++ {
+					if err := f.Update(newObj, "fieldmanager_test"); err != nil {
+						b.Fatal(err)
+					}
+					if err := f.Update(newObj, "fieldmanager_test_2"); err != nil {
+						b.Fatal(err)
+					}
+					f.Reset()
+				}
+			})
+			b.Run("Apply", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for n := 0; n < b.N; n++ {
+					if err := f.Apply(appliedObj, "fieldmanager_test", false); err != nil {
+						b.Fatal(err)
+					}
+					f.Reset()
+				}
+			})
+			b.Run("UpdateApply", func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for n := 0; n < b.N; n++ {
+					if err := f.Update(newObj, "fieldmanager_test"); err != nil {
+						b.Fatal(err)
+					}
+					if err := f.Apply(appliedObj, "fieldmanager_test", false); err != nil {
+						b.Fatal(err)
+					}
+					f.Reset()
+				}
+			})
+		})
+	}
+}
 
-	}`
-	newObj := &unstructured.Unstructured{Object: map[string]interface{}{}}
-	if err := yaml.Unmarshal([]byte(y), &newObj.Object); err != nil {
-		b.Fatalf("Failed to parse yaml object: %v", err)
+func toUnstructured(b *testing.B, o runtime.Object) *unstructured.Unstructured {
+	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(o)
+	if err != nil {
+		b.Fatalf("Failed to unmarshal to json: %v", err)
+	}
+	return &unstructured.Unstructured{Object: u}
+}
+
+func BenchmarkConvertObjectToTyped(b *testing.B) {
+	tests := []struct {
+		gvk schema.GroupVersionKind
+		obj []byte
+	}{
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Pod"),
+			obj: getObjectBytes("pod.yaml"),
+		},
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Node"),
+			obj: getObjectBytes("node.yaml"),
+		},
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Endpoints"),
+			obj: getObjectBytes("endpoints.yaml"),
+		},
+	}
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		b.Fatalf("Failed to add to scheme: %v", err)
 	}
 
-	b.ReportAllocs()
-	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
-		err := f.Update(newObj, "fieldmanager_test")
-		if err != nil {
-			b.Fatal(err)
-		}
-		f.Reset()
+	for _, test := range tests {
+		b.Run(test.gvk.Kind, func(b *testing.B) {
+			decoder := serializer.NewCodecFactory(scheme).UniversalDecoder(test.gvk.GroupVersion())
+			m := NewFakeOpenAPIModels()
+			typeConverter := NewFakeTypeConverter(m)
+
+			structured, err := runtime.Decode(decoder, test.obj)
+			if err != nil {
+				b.Fatalf("Failed to parse yaml object: %v", err)
+			}
+			b.Run("structured", func(b *testing.B) {
+				b.ReportAllocs()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						_, err := typeConverter.ObjectToTyped(structured)
+						if err != nil {
+							b.Errorf("Error in ObjectToTyped: %v", err)
+						}
+					}
+				})
+			})
+
+			unstructured := toUnstructured(b, structured)
+			b.Run("unstructured", func(b *testing.B) {
+				b.ReportAllocs()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						_, err := typeConverter.ObjectToTyped(unstructured)
+						if err != nil {
+							b.Errorf("Error in ObjectToTyped: %v", err)
+						}
+					}
+				})
+			})
+		})
+	}
+}
+
+func BenchmarkCompare(b *testing.B) {
+	tests := []struct {
+		gvk schema.GroupVersionKind
+		obj []byte
+	}{
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Pod"),
+			obj: getObjectBytes("pod.yaml"),
+		},
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Node"),
+			obj: getObjectBytes("node.yaml"),
+		},
+		{
+			gvk: schema.FromAPIVersionAndKind("v1", "Endpoints"),
+			obj: getObjectBytes("endpoints.yaml"),
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		b.Fatalf("Failed to add to scheme: %v", err)
+	}
+
+	for _, test := range tests {
+		b.Run(test.gvk.Kind, func(b *testing.B) {
+			decoder := serializer.NewCodecFactory(scheme).UniversalDecoder(test.gvk.GroupVersion())
+			m := NewFakeOpenAPIModels()
+			typeConverter := NewFakeTypeConverter(m)
+
+			structured, err := runtime.Decode(decoder, test.obj)
+			if err != nil {
+				b.Fatal(err)
+			}
+			tv1, err := typeConverter.ObjectToTyped(structured)
+			if err != nil {
+				b.Errorf("Error in ObjectToTyped: %v", err)
+			}
+			tv2, err := typeConverter.ObjectToTyped(structured)
+			if err != nil {
+				b.Errorf("Error in ObjectToTyped: %v", err)
+			}
+
+			b.Run("structured", func(b *testing.B) {
+				b.ReportAllocs()
+				for n := 0; n < b.N; n++ {
+					_, err = tv1.Compare(tv2)
+					if err != nil {
+						b.Errorf("Error in ObjectToTyped: %v", err)
+					}
+				}
+			})
+
+			unstructured := toUnstructured(b, structured)
+			utv1, err := typeConverter.ObjectToTyped(unstructured)
+			if err != nil {
+				b.Errorf("Error in ObjectToTyped: %v", err)
+			}
+			utv2, err := typeConverter.ObjectToTyped(unstructured)
+			if err != nil {
+				b.Errorf("Error in ObjectToTyped: %v", err)
+			}
+			b.Run("unstructured", func(b *testing.B) {
+				b.ReportAllocs()
+				b.RunParallel(func(pb *testing.PB) {
+					for pb.Next() {
+						_, err = utv1.Compare(utv2)
+						if err != nil {
+							b.Errorf("Error in ObjectToTyped: %v", err)
+						}
+					}
+				})
+			})
+		})
 	}
 }
 
 func BenchmarkRepeatedUpdate(b *testing.B) {
-	f := NewTestFieldManager()
+	f := NewTestFieldManager(schema.FromAPIVersionAndKind("v1", "Pod"))
+	podBytes := getObjectBytes("pod.yaml")
 
-	y1 := `{
-		"apiVersion": "apps/v1",
-		"kind": "Deployment",
-		"metadata": {
-			"name": "b",
-			"namespace": "b",
-			"creationTimestamp": "2016-05-19T09:59:00Z",
-		},
-                "map": {
-                        "fieldA": 1,
-                        "fieldB": 1,
-                        "fieldC": 1,
-                        "fieldD": 1,
-                        "fieldE": 1,
-                        "fieldF": 1,
-                        "fieldG": 1,
-                        "fieldH": 1,
-                        "fieldI": 1,
-                        "fieldJ": 1,
-                        "fieldK": 1,
-                        "fieldL": 1,
-                        "fieldM": 1,
-                        "fieldN": {
-	                        "fieldN": {
-					"fieldN": {
-						"fieldN": {
-				                        "fieldN": {
-								"value": true
-							},
-						},
-					},
-				},
-			},
-		},
-
-	}`
-	obj1 := &unstructured.Unstructured{Object: map[string]interface{}{}}
-	if err := yaml.Unmarshal([]byte(y1), &obj1.Object); err != nil {
+	var obj *corev1.Pod
+	if err := yaml.Unmarshal(podBytes, &obj); err != nil {
 		b.Fatalf("Failed to parse yaml object: %v", err)
 	}
-	y2 := `{
-		"apiVersion": "apps/v1",
-		"kind": "Deployment",
-		"metadata": {
-			"name": "b",
-			"namespace": "b",
-			"creationTimestamp": "2016-05-19T09:59:00Z",
-		},
-                "map": {
-                        "fieldA": 1,
-                        "fieldB": 1,
-                        "fieldC": 1,
-                        "fieldD": 1,
-                        "fieldE": 1,
-                        "fieldF": 1,
-                        "fieldG": 1,
-                        "fieldH": 1,
-                        "fieldI": 1,
-                        "fieldJ": 1,
-                        "fieldK": 1,
-                        "fieldL": 1,
-                        "fieldM": 1,
-                        "fieldN": {
-	                        "fieldN": {
-					"fieldN": {
-						"fieldN": {
-				                        "fieldN": {
-								"value": false
-							},
-						},
-					},
-				},
-			},
-		},
+	obj.Spec.Containers[0].Image = "nginx:latest"
+	objs := []*corev1.Pod{obj}
+	obj = obj.DeepCopy()
+	obj.Spec.Containers[0].Image = "nginx:4.3"
+	objs = append(objs, obj)
 
-	}`
-	obj2 := &unstructured.Unstructured{Object: map[string]interface{}{}}
-	if err := yaml.Unmarshal([]byte(y2), &obj2.Object); err != nil {
-		b.Fatalf("Failed to parse yaml object: %v", err)
-	}
-	y3 := `{
-		"apiVersion": "apps/v1",
-		"kind": "Deployment",
-		"metadata": {
-			"name": "b",
-			"namespace": "b",
-			"creationTimestamp": "2016-05-19T09:59:00Z",
-		},
-                "map": {
-                        "fieldA": 1,
-                        "fieldB": 1,
-                        "fieldC": 1,
-                        "fieldD": 1,
-                        "fieldE": 1,
-                        "fieldF": 1,
-                        "fieldG": 1,
-                        "fieldH": 1,
-                        "fieldI": 1,
-                        "fieldJ": 1,
-                        "fieldK": 1,
-                        "fieldL": 1,
-                        "fieldM": 1,
-                        "fieldN": {
-	                        "fieldN": {
-					"fieldN": {
-						"fieldN": {
-				                        "fieldN": {
-								"value": true
-							},
-						},
-					},
-				},
-			},
-                        "fieldO": 1,
-                        "fieldP": 1,
-                        "fieldQ": 1,
-                        "fieldR": 1,
-                        "fieldS": 1,
-		},
-
-	}`
-	obj3 := &unstructured.Unstructured{Object: map[string]interface{}{}}
-	if err := yaml.Unmarshal([]byte(y3), &obj3.Object); err != nil {
-		b.Fatalf("Failed to parse yaml object: %v", err)
+	appliedObj := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	if err := yaml.Unmarshal(podBytes, &appliedObj.Object); err != nil {
+		b.Fatalf("error decoding YAML: %v", err)
 	}
 
-	objs := []*unstructured.Unstructured{obj1, obj2, obj3}
-
-	if err := f.Update(objs[0], "fieldmanager_0"); err != nil {
+	err := f.Apply(appliedObj, "fieldmanager_apply", false)
+	if err != nil {
 		b.Fatal(err)
 	}
 
@@ -493,14 +677,10 @@ func BenchmarkRepeatedUpdate(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	if err := f.Update(objs[2], "fieldmanager_2"); err != nil {
-		b.Fatal(err)
-	}
-
 	b.ReportAllocs()
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		err := f.Update(objs[n%3], fmt.Sprintf("fieldmanager_%d", n%3))
+		err := f.Update(objs[n%len(objs)], fmt.Sprintf("fieldmanager_%d", n%len(objs)))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -509,10 +689,11 @@ func BenchmarkRepeatedUpdate(b *testing.B) {
 }
 
 func TestApplyFailsWithManagedFields(t *testing.T) {
-	f := NewTestFieldManager()
+	f := NewTestFieldManager(schema.FromAPIVersionAndKind("v1", "Pod"))
 
-	err := f.Apply([]byte(`{
-		"apiVersion": "apps/v1",
+	appliedObj := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	if err := yaml.Unmarshal([]byte(`{
+		"apiVersion": "v1",
 		"kind": "Pod",
 		"metadata": {
 			"managedFields": [
@@ -521,7 +702,11 @@ func TestApplyFailsWithManagedFields(t *testing.T) {
 				}
 			]
 		}
-	}`), "fieldmanager_test", false)
+	}`), &appliedObj.Object); err != nil {
+		t.Fatalf("error decoding YAML: %v", err)
+	}
+
+	err := f.Apply(appliedObj, "fieldmanager_test", false)
 
 	if err == nil {
 		t.Fatalf("successfully applied with set managed fields")
@@ -529,19 +714,72 @@ func TestApplyFailsWithManagedFields(t *testing.T) {
 }
 
 func TestApplySuccessWithNoManagedFields(t *testing.T) {
-	f := NewTestFieldManager()
+	f := NewTestFieldManager(schema.FromAPIVersionAndKind("v1", "Pod"))
 
-	err := f.Apply([]byte(`{
-		"apiVersion": "apps/v1",
+	appliedObj := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	if err := yaml.Unmarshal([]byte(`{
+		"apiVersion": "v1",
 		"kind": "Pod",
 		"metadata": {
 			"labels": {
 				"a": "b"
 			},
 		}
-	}`), "fieldmanager_test", false)
+	}`), &appliedObj.Object); err != nil {
+		t.Fatalf("error decoding YAML: %v", err)
+	}
+	err := f.Apply(appliedObj, "fieldmanager_test", false)
 
 	if err != nil {
 		t.Fatalf("failed to apply object: %v", err)
+	}
+}
+
+// Run an update and apply, and make sure that nothing has changed.
+func TestNoOpChanges(t *testing.T) {
+	f := NewTestFieldManager(schema.FromAPIVersionAndKind("v1", "Pod"))
+
+	obj := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	if err := yaml.Unmarshal([]byte(`{
+		"apiVersion": "v1",
+		"kind": "Pod",
+		"metadata": {
+			"labels": {
+				"a": "b"
+			},
+		}
+	}`), &obj.Object); err != nil {
+		t.Fatalf("error decoding YAML: %v", err)
+	}
+	if err := f.Apply(obj, "fieldmanager_test_apply", false); err != nil {
+		t.Fatalf("failed to apply object: %v", err)
+	}
+	before := f.liveObj.DeepCopyObject()
+	// Wait to make sure the timestamp is different
+	time.Sleep(time.Second)
+	// Applying with a different fieldmanager will create an entry..
+	if err := f.Apply(obj, "fieldmanager_test_apply_other", false); err != nil {
+		t.Fatalf("failed to update object: %v", err)
+	}
+	if reflect.DeepEqual(before, f.liveObj) {
+		t.Fatalf("Applying no-op apply with new manager didn't change object: \n%v", f.liveObj)
+	}
+	before = f.liveObj.DeepCopyObject()
+	// Wait to make sure the timestamp is different
+	time.Sleep(time.Second)
+	if err := f.Update(obj, "fieldmanager_test_update"); err != nil {
+		t.Fatalf("failed to update object: %v", err)
+	}
+	if !reflect.DeepEqual(before, f.liveObj) {
+		t.Fatalf("No-op update has changed the object:\n%v\n---\n%v", before, f.liveObj)
+	}
+	before = f.liveObj.DeepCopyObject()
+	// Wait to make sure the timestamp is different
+	time.Sleep(time.Second)
+	if err := f.Apply(obj, "fieldmanager_test_apply", true); err != nil {
+		t.Fatalf("failed to re-apply object: %v", err)
+	}
+	if !reflect.DeepEqual(before, f.liveObj) {
+		t.Fatalf("No-op apply has changed the object:\n%v\n---\n%v", before, f.liveObj)
 	}
 }

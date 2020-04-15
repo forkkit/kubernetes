@@ -31,6 +31,8 @@ import (
 // (api format) to the format used by sigs.k8s.io/structured-merge-diff and back
 func TestRoundTripManagedFields(t *testing.T) {
 	tests := []string{
+		`null
+`,
 		`- apiVersion: v1
   fieldsType: FieldsV1
   fieldsV1:
@@ -146,7 +148,7 @@ func TestRoundTripManagedFields(t *testing.T) {
 			if err != nil {
 				t.Fatalf("did not expect decoding error but got: %v", err)
 			}
-			encoded, err := encodeManagedFields(decoded)
+			encoded, err := encodeManagedFields(&decoded)
 			if err != nil {
 				t.Fatalf("did not expect encoding error but got: %v", err)
 			}
@@ -322,6 +324,19 @@ func TestSortEncodedManagedFields(t *testing.T) {
 				{Manager: "d", Operation: metav1.ManagedFieldsOperationUpdate, Time: parseTimeOrPanic("2002-01-01T01:00:00Z")},
 				{Manager: "f", Operation: metav1.ManagedFieldsOperationUpdate, Time: parseTimeOrPanic("2002-01-01T01:00:00Z")},
 				{Manager: "e", Operation: metav1.ManagedFieldsOperationUpdate, Time: parseTimeOrPanic("2003-01-01T01:00:00Z")},
+			},
+		},
+		{
+			name: "sort drops nanoseconds",
+			managedFields: []metav1.ManagedFieldsEntry{
+				{Manager: "c", Operation: metav1.ManagedFieldsOperationUpdate, Time: &metav1.Time{time.Date(2000, time.January, 0, 0, 0, 0, 1, time.UTC)}},
+				{Manager: "a", Operation: metav1.ManagedFieldsOperationUpdate, Time: &metav1.Time{time.Date(2000, time.January, 0, 0, 0, 0, 2, time.UTC)}},
+				{Manager: "b", Operation: metav1.ManagedFieldsOperationUpdate, Time: &metav1.Time{time.Date(2000, time.January, 0, 0, 0, 0, 3, time.UTC)}},
+			},
+			expected: []metav1.ManagedFieldsEntry{
+				{Manager: "a", Operation: metav1.ManagedFieldsOperationUpdate, Time: &metav1.Time{time.Date(2000, time.January, 0, 0, 0, 0, 2, time.UTC)}},
+				{Manager: "b", Operation: metav1.ManagedFieldsOperationUpdate, Time: &metav1.Time{time.Date(2000, time.January, 0, 0, 0, 0, 3, time.UTC)}},
+				{Manager: "c", Operation: metav1.ManagedFieldsOperationUpdate, Time: &metav1.Time{time.Date(2000, time.January, 0, 0, 0, 0, 1, time.UTC)}},
 			},
 		},
 	}

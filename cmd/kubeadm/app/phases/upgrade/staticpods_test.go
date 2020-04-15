@@ -28,14 +28,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/pkg/transport"
 	"github.com/pkg/errors"
+	"go.etcd.io/etcd/pkg/transport"
 
 	"k8s.io/client-go/tools/clientcmd"
 	certutil "k8s.io/client-go/util/cert"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	certsphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/certs/renewal"
 	controlplanephase "k8s.io/kubernetes/cmd/kubeadm/app/phases/controlplane"
@@ -245,16 +244,6 @@ func (c fakeTLSEtcdClient) CheckClusterHealth() error {
 	return nil
 }
 
-func (c fakeTLSEtcdClient) GetClusterVersions() (map[string]string, error) {
-	return map[string]string{
-		"https://1.2.3.4:2379": "3.1.12",
-	}, nil
-}
-
-func (c fakeTLSEtcdClient) GetVersion() (string, error) {
-	return "3.1.12", nil
-}
-
 func (c fakeTLSEtcdClient) Sync() error { return nil }
 
 func (c fakeTLSEtcdClient) AddMember(name string, peerAddrs string) ([]etcdutil.Member, error) {
@@ -284,16 +273,6 @@ func (c fakePodManifestEtcdClient) CheckClusterHealth() error {
 	}
 	_, err := tlsInfo.ClientConfig()
 	return err
-}
-
-func (c fakePodManifestEtcdClient) GetClusterVersions() (map[string]string, error) {
-	return map[string]string{
-		"https://1.2.3.4:2379": "3.1.12",
-	}, nil
-}
-
-func (c fakePodManifestEtcdClient) GetVersion() (string, error) {
-	return "3.1.12", nil
 }
 
 func (c fakePodManifestEtcdClient) Sync() error { return nil }
@@ -432,7 +411,7 @@ func TestStaticPodControlPlane(t *testing.T) {
 			moveFileFunc: func(oldPath, newPath string) error {
 				return os.Rename(oldPath, newPath)
 			},
-			skipKubeConfig:       kubeadmconstants.SchedulerKubeConfigFileName,
+			skipKubeConfig:       constants.SchedulerKubeConfigFileName,
 			expectedErr:          true,
 			manifestShouldChange: false,
 		},
@@ -446,7 +425,7 @@ func TestStaticPodControlPlane(t *testing.T) {
 			moveFileFunc: func(oldPath, newPath string) error {
 				return os.Rename(oldPath, newPath)
 			},
-			skipKubeConfig:       kubeadmconstants.AdminKubeConfigFileName,
+			skipKubeConfig:       constants.AdminKubeConfigFileName,
 			expectedErr:          true,
 			manifestShouldChange: false,
 		},
@@ -488,9 +467,9 @@ func TestStaticPodControlPlane(t *testing.T) {
 			}
 
 			for _, kubeConfig := range []string{
-				kubeadmconstants.AdminKubeConfigFileName,
-				kubeadmconstants.SchedulerKubeConfigFileName,
-				kubeadmconstants.ControllerManagerKubeConfigFileName,
+				constants.AdminKubeConfigFileName,
+				constants.SchedulerKubeConfigFileName,
+				constants.ControllerManagerKubeConfigFileName,
 			} {
 				if rt.skipKubeConfig == kubeConfig {
 					continue
@@ -743,14 +722,14 @@ func TestRenewCertsByComponent(t *testing.T) {
 			name:      "all CA exist, should be rotated for scheduler",
 			component: constants.KubeScheduler,
 			kubeConfigShouldExist: []string{
-				kubeadmconstants.SchedulerKubeConfigFileName,
+				constants.SchedulerKubeConfigFileName,
 			},
 		},
 		{
 			name:      "all CA exist, should be rotated for controller manager",
 			component: constants.KubeControllerManager,
 			kubeConfigShouldExist: []string{
-				kubeadmconstants.ControllerManagerKubeConfigFileName,
+				constants.ControllerManagerKubeConfigFileName,
 			},
 		},
 		{
@@ -850,7 +829,7 @@ func TestRenewCertsByComponent(t *testing.T) {
 					t.Errorf("couldn't load new certificate %q: %v", kubeCert.Name, err)
 					continue
 				}
-				oldSerial, _ := certMaps[kubeCert.Name]
+				oldSerial := certMaps[kubeCert.Name]
 
 				shouldBeRenewed := true
 				if test.certsShouldBeRenewed != nil {
@@ -876,7 +855,7 @@ func TestRenewCertsByComponent(t *testing.T) {
 				if err != nil {
 					t.Fatalf("error reading embedded certs from %s: %v", kubeConfig, err)
 				}
-				oldSerial, _ := certMaps[kubeConfig]
+				oldSerial := certMaps[kubeConfig]
 				if oldSerial.Cmp(newCerts[0].SerialNumber) == 0 {
 					t.Errorf("certifitate %v was not reissued", kubeConfig)
 				}
@@ -901,7 +880,7 @@ func getEmbeddedCerts(tmpDir, kubeConfig string) ([]*x509.Certificate, error) {
 
 func TestGetPathManagerForUpgrade(t *testing.T) {
 
-	haEtcd := &kubeadmapi.InitConfiguration{
+	externalEtcd := &kubeadmapi.InitConfiguration{
 		ClusterConfiguration: kubeadmapi.ClusterConfiguration{
 			Etcd: kubeadmapi.Etcd{
 				External: &kubeadmapi.ExternalEtcd{
@@ -911,7 +890,7 @@ func TestGetPathManagerForUpgrade(t *testing.T) {
 		},
 	}
 
-	noHAEtcd := &kubeadmapi.InitConfiguration{}
+	stackedEtcd := &kubeadmapi.InitConfiguration{}
 
 	tests := []struct {
 		name             string
@@ -920,22 +899,28 @@ func TestGetPathManagerForUpgrade(t *testing.T) {
 		shouldDeleteEtcd bool
 	}{
 		{
-			name:             "ha etcd but no etcd upgrade",
-			cfg:              haEtcd,
+			name:             "external etcd but no etcd upgrade",
+			cfg:              externalEtcd,
 			etcdUpgrade:      false,
 			shouldDeleteEtcd: true,
 		},
 		{
-			name:             "non-ha etcd with etcd upgrade",
-			cfg:              noHAEtcd,
-			etcdUpgrade:      true,
-			shouldDeleteEtcd: false,
-		},
-		{
-			name:             "ha etcd and etcd upgrade",
-			cfg:              haEtcd,
+			name:             "external etcd with etcd upgrade",
+			cfg:              externalEtcd,
 			etcdUpgrade:      true,
 			shouldDeleteEtcd: true,
+		},
+		{
+			name:             "stacked etcd but no etcd upgrade",
+			cfg:              stackedEtcd,
+			etcdUpgrade:      false,
+			shouldDeleteEtcd: true,
+		},
+		{
+			name:             "stacked etcd with etcd upgrade",
+			cfg:              stackedEtcd,
+			etcdUpgrade:      true,
+			shouldDeleteEtcd: false,
 		},
 	}
 
@@ -983,4 +968,37 @@ func TestGetPathManagerForUpgrade(t *testing.T) {
 		})
 	}
 
+}
+
+func TestGetEtcdImageTagFromStaticPod(t *testing.T) {
+	const expectedEtcdVersion = "3.1.12"
+	const etcdStaticPod = `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    component: etcd
+    tier: control-plane
+  name: etcd
+  namespace: kube-system
+spec:
+  containers:
+  - name: etcd
+    image: k8s.gcr.io/etcd:` + expectedEtcdVersion
+
+	manifestsDir, err := ioutil.TempDir("", "GetEtcdImageTagFromStaticPod-test-manifests")
+	if err != nil {
+		t.Fatalf("Unable to create temporary directory: %v", err)
+	}
+	defer os.RemoveAll(manifestsDir)
+
+	if err = ioutil.WriteFile(constants.GetStaticPodFilepath(constants.Etcd, manifestsDir), []byte(etcdStaticPod), 0644); err != nil {
+		t.Fatalf("Unable to create test static pod manifest: %v", err)
+	}
+
+	got, err := GetEtcdImageTagFromStaticPod(manifestsDir)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	} else if got != expectedEtcdVersion {
+		t.Errorf("unexpected result:\n\tgot: %q\n\texpected: %q", got, expectedEtcdVersion)
+	}
 }

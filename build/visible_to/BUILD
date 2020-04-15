@@ -98,7 +98,6 @@ package_group(
     name = "pkg_kubectl_cmd_CONSUMERS_BAD",
     packages = [
         "//cmd/clicheck",
-        "//cmd/hyperkube",
     ],
 )
 
@@ -213,7 +212,6 @@ package_group(
         "//staging/src/k8s.io/kubectl/pkg/cmd/portforward",
         "//staging/src/k8s.io/kubectl/pkg/cmd/proxy",
         "//staging/src/k8s.io/kubectl/pkg/cmd/replace",
-        "//staging/src/k8s.io/kubectl/pkg/cmd/rollingupdate",
         "//staging/src/k8s.io/kubectl/pkg/cmd/rollout",
         "//staging/src/k8s.io/kubectl/pkg/cmd/run",
         "//staging/src/k8s.io/kubectl/pkg/cmd/scale",
@@ -241,7 +239,6 @@ package_group(
         "//pkg/kubectl/cmd/auth",
         "//pkg/kubectl/cmd/convert",
         "//pkg/kubectl/cmd/cp",
-        "//pkg/kubectl/cmd/get",
         "//pkg/kubectl/explain",
         "//staging/src/k8s.io/kubectl/pkg/cmd",
         "//staging/src/k8s.io/kubectl/pkg/cmd/annotate",
@@ -256,12 +253,12 @@ package_group(
         "//staging/src/k8s.io/kubectl/pkg/cmd/edit",
         "//staging/src/k8s.io/kubectl/pkg/cmd/exec",
         "//staging/src/k8s.io/kubectl/pkg/cmd/expose",
+        "//staging/src/k8s.io/kubectl/pkg/cmd/get",
         "//staging/src/k8s.io/kubectl/pkg/cmd/label",
         "//staging/src/k8s.io/kubectl/pkg/cmd/logs",
         "//staging/src/k8s.io/kubectl/pkg/cmd/patch",
         "//staging/src/k8s.io/kubectl/pkg/cmd/portforward",
         "//staging/src/k8s.io/kubectl/pkg/cmd/replace",
-        "//staging/src/k8s.io/kubectl/pkg/cmd/rollingupdate",
         "//staging/src/k8s.io/kubectl/pkg/cmd/rollout",
         "//staging/src/k8s.io/kubectl/pkg/cmd/run",
         "//staging/src/k8s.io/kubectl/pkg/cmd/set",
@@ -313,7 +310,6 @@ package_group(
         "//staging/src/k8s.io/kubectl/pkg/cmd/portforward",
         "//staging/src/k8s.io/kubectl/pkg/cmd/proxy",
         "//staging/src/k8s.io/kubectl/pkg/cmd/replace",
-        "//staging/src/k8s.io/kubectl/pkg/cmd/rollingupdate",
         "//staging/src/k8s.io/kubectl/pkg/cmd/rollout",
         "//staging/src/k8s.io/kubectl/pkg/cmd/run",
         "//staging/src/k8s.io/kubectl/pkg/cmd/scale",
@@ -424,9 +420,22 @@ package_group(
         "//staging/src/k8s.io/kubectl/pkg/cmd",
         "//staging/src/k8s.io/kubectl/pkg/cmd/apply",
         "//staging/src/k8s.io/kubectl/pkg/cmd/replace",
-        "//staging/src/k8s.io/kubectl/pkg/cmd/rollingupdate",
         "//staging/src/k8s.io/kubectl/pkg/cmd/testing",
         "//staging/src/k8s.io/kubectl/pkg/cmd/util",
+    ],
+)
+
+package_group(
+    name = "vendor_githubcom_prometheus_CONSUMERS",
+    packages = [
+        "//cluster/images/etcd-version-monitor",
+        "//pkg/scheduler/framework/v1alpha1",
+        "//pkg/volume/util/operationexecutor",
+        "//staging/src/k8s.io/apiserver/pkg/admission/metrics",
+        "//staging/src/k8s.io/apiserver/pkg/util/flowcontrol/metrics",
+        "//staging/src/k8s.io/component-base/metrics/...",
+        "//test/e2e_node",
+        "//vendor/...",
     ],
 )
 

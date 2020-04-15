@@ -17,6 +17,7 @@ limitations under the License.
 package resourcequota
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sync"
@@ -128,7 +129,7 @@ func NewResourceQuotaController(options *ResourceQuotaControllerOptions) (*Resou
 				// responsible for enqueue of all resource quotas when doing a full resync (enqueueAll)
 				oldResourceQuota := old.(*v1.ResourceQuota)
 				curResourceQuota := cur.(*v1.ResourceQuota)
-				if quota.V1Equals(oldResourceQuota.Spec.Hard, curResourceQuota.Spec.Hard) {
+				if quota.Equals(oldResourceQuota.Spec.Hard, curResourceQuota.Spec.Hard) {
 					return
 				}
 				rq.addQuota(curResourceQuota)
@@ -355,7 +356,7 @@ func (rq *ResourceQuotaController) syncResourceQuota(resourceQuota *v1.ResourceQ
 
 	// there was a change observed by this controller that requires we update quota
 	if dirty {
-		_, err = rq.rqClient.ResourceQuotas(usage.Namespace).UpdateStatus(usage)
+		_, err = rq.rqClient.ResourceQuotas(usage.Namespace).UpdateStatus(context.TODO(), usage, metav1.UpdateOptions{})
 		if err != nil {
 			errors = append(errors, err)
 		}

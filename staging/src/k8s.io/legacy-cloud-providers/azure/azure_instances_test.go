@@ -26,19 +26,20 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-07-01/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-12-01/compute"
 	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/golang/mock/gomock"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	cloudprovider "k8s.io/cloud-provider"
+	"k8s.io/legacy-cloud-providers/azure/clients/vmclient/mockvmclient"
+	"k8s.io/legacy-cloud-providers/azure/retry"
 )
 
 // setTestVirtualMachines sets test virtual machine with powerstate.
-func setTestVirtualMachines(c *Cloud, vmList map[string]string, isDataDisksFull bool) {
-	virtualMachineClient := c.VirtualMachinesClient.(*fakeAzureVirtualMachinesClient)
-	store := map[string]map[string]compute.VirtualMachine{
-		"rg": make(map[string]compute.VirtualMachine),
-	}
+func setTestVirtualMachines(c *Cloud, vmList map[string]string, isDataDisksFull bool) []compute.VirtualMachine {
+	expectedVMs := make([]compute.VirtualMachine, 0)
 
 	for nodeName, powerState := range vmList {
 		instanceID := fmt.Sprintf("/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/%s", nodeName)
@@ -75,14 +76,18 @@ func setTestVirtualMachines(c *Cloud, vmList map[string]string, isDataDisksFull 
 			}
 			vm.StorageProfile.DataDisks = &dataDisks
 		}
-		store["rg"][nodeName] = vm
+
+		expectedVMs = append(expectedVMs, vm)
 	}
 
-	virtualMachineClient.setFakeStore(store)
+	return expectedVMs
 }
 
 func TestInstanceID(t *testing.T) {
-	cloud := getTestCloud()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	cloud := GetTestCloud(ctrl)
 	cloud.Config.UseInstanceMetadata = true
 
 	testcases := []struct {
@@ -123,7 +128,7 @@ func TestInstanceID(t *testing.T) {
 
 		mux := http.NewServeMux()
 		mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintf(w, fmt.Sprintf(`{"compute":{"name":"%s","subscriptionId":"subscription","resourceGroupName":"rg"}}`, test.metadataName))
+			fmt.Fprint(w, fmt.Sprintf(`{"compute":{"name":"%s","subscriptionId":"subscription","resourceGroupName":"rg"}}`, test.metadataName))
 		}))
 		go func() {
 			http.Serve(listener, mux)
@@ -138,7 +143,14 @@ func TestInstanceID(t *testing.T) {
 		for _, vm := range test.vmList {
 			vmListWithPowerState[vm] = ""
 		}
-		setTestVirtualMachines(cloud, vmListWithPowerState, false)
+		expectedVMs := setTestVirtualMachines(cloud, vmListWithPowerState, false)
+		mockVMsClient := cloud.VirtualMachinesClient.(*mockvmclient.MockInterface)
+		for _, vm := range expectedVMs {
+			mockVMsClient.EXPECT().Get(gomock.Any(), cloud.ResourceGroup, *vm.Name, gomock.Any()).Return(vm, nil).AnyTimes()
+		}
+		mockVMsClient.EXPECT().Get(gomock.Any(), cloud.ResourceGroup, "vm3", gomock.Any()).Return(compute.VirtualMachine{}, &retry.Error{HTTPStatusCode: http.StatusNotFound, RawError: cloudprovider.InstanceNotFound}).AnyTimes()
+		mockVMsClient.EXPECT().Update(gomock.Any(), cloud.ResourceGroup, gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
 		instanceID, err := cloud.InstanceID(context.Background(), types.NodeName(test.nodeName))
 		if test.expectError {
 			if err == nil {
@@ -214,9 +226,17 @@ func TestInstanceShutdownByProviderID(t *testing.T) {
 		},
 	}
 
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
 	for _, test := range testcases {
-		cloud := getTestCloud()
-		setTestVirtualMachines(cloud, test.vmList, false)
+		cloud := GetTestCloud(ctrl)
+		expectedVMs := setTestVirtualMachines(cloud, test.vmList, false)
+		mockVMsClient := cloud.VirtualMachinesClient.(*mockvmclient.MockInterface)
+		for _, vm := range expectedVMs {
+			mockVMsClient.EXPECT().Get(gomock.Any(), cloud.ResourceGroup, *vm.Name, gomock.Any()).Return(vm, nil).AnyTimes()
+		}
+		mockVMsClient.EXPECT().Get(gomock.Any(), cloud.ResourceGroup, "vm8", gomock.Any()).Return(compute.VirtualMachine{}, &retry.Error{HTTPStatusCode: http.StatusNotFound, RawError: cloudprovider.InstanceNotFound}).AnyTimes()
+
 		providerID := "azure://" + cloud.getStandardMachineID("subscription", "rg", test.nodeName)
 		hasShutdown, err := cloud.InstanceShutdownByProviderID(context.Background(), providerID)
 		if test.expectError {
@@ -236,7 +256,9 @@ func TestInstanceShutdownByProviderID(t *testing.T) {
 }
 
 func TestNodeAddresses(t *testing.T) {
-	cloud := getTestCloud()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	cloud := GetTestCloud(ctrl)
 	cloud.Config.UseInstanceMetadata = true
 	metadataTemplate := `{"compute":{"name":"%s"},"network":{"interface":[{"ipv4":{"ipAddress":[{"privateIpAddress":"%s","publicIpAddress":"%s"}]},"ipv6":{"ipAddress":[{"privateIpAddress":"%s","publicIpAddress":"%s"}]}}]}}`
 
@@ -325,7 +347,7 @@ func TestNodeAddresses(t *testing.T) {
 
 		mux := http.NewServeMux()
 		mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintf(w, fmt.Sprintf(metadataTemplate, test.nodeName, test.ipV4, test.ipV4Public, test.ipV6, test.ipV6Public))
+			fmt.Fprint(w, fmt.Sprintf(metadataTemplate, test.nodeName, test.ipV4, test.ipV4Public, test.ipV6, test.ipV6Public))
 		}))
 		go func() {
 			http.Serve(listener, mux)
@@ -350,6 +372,59 @@ func TestNodeAddresses(t *testing.T) {
 
 		if !reflect.DeepEqual(ipAddresses, test.expected) {
 			t.Errorf("Test [%s] unexpected ipAddresses: %s, expected %q", test.name, ipAddresses, test.expected)
+		}
+	}
+}
+
+func TestIsCurrentInstance(t *testing.T) {
+	cloud := &Cloud{
+		Config: Config{
+			VMType: vmTypeVMSS,
+		},
+	}
+	testcases := []struct {
+		nodeName       string
+		metadataVMName string
+		expected       bool
+		expectError    bool
+	}{
+		{
+			nodeName:       "node1",
+			metadataVMName: "node1",
+			expected:       true,
+		},
+		{
+			nodeName:       "node1",
+			metadataVMName: "node2",
+			expected:       false,
+		},
+		{
+			nodeName:       "vmss000001",
+			metadataVMName: "vmss_1",
+			expected:       true,
+		},
+		{
+			nodeName:       "vmss_2",
+			metadataVMName: "vmss000000",
+			expected:       false,
+		},
+		{
+			nodeName:       "vmss123456",
+			metadataVMName: "vmss_$123",
+			expected:       false,
+			expectError:    true,
+		},
+	}
+
+	for i, test := range testcases {
+		real, err := cloud.isCurrentInstance(types.NodeName(test.nodeName), test.metadataVMName)
+		if test.expectError {
+			if err == nil {
+				t.Errorf("Test[%d] unexpected nil err", i)
+			}
+		}
+		if real != test.expected {
+			t.Errorf("Test[%d] unexpected isCurrentInstance result %v != %v", i, real, test.expected)
 		}
 	}
 }

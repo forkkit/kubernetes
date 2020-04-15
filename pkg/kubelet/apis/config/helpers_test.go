@@ -212,8 +212,10 @@ var (
 		"ReadOnlyPort",
 		"RegistryBurst",
 		"RegistryPullQPS",
+		"ReservedSystemCPUs",
 		"RuntimeRequestTimeout.Duration",
 		"SerializeImagePulls",
+		"ShowHiddenMetricsForVersion",
 		"StreamingConnectionIdleTimeout.Duration",
 		"SyncFrequency.Duration",
 		"SystemCgroups",
@@ -222,5 +224,6 @@ var (
 		"TypeMeta.APIVersion",
 		"TypeMeta.Kind",
 		"VolumeStatsAggPeriod.Duration",
+		"VolumePluginDir",
 	)
 )
